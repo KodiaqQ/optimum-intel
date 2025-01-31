@@ -326,6 +326,9 @@ class OVQuantizationConfigBase(QuantizationConfigMixin):
             return nncf.IgnoredScope()
         return nncf.IgnoredScope(**copy.deepcopy(self.ignored_scope))
 
+    def to_nncf_dict(self) -> Dict[str, Any]:
+        raise NotImplementedError
+
 
 @dataclass
 class OVWeightQuantizationConfig(OVQuantizationConfigBase):
@@ -565,6 +568,43 @@ class OVWeightQuantizationConfig(OVQuantizationConfigBase):
         if self.gptq and self.lora_correction:
             raise ValueError("The GPTQ and LoRA Correction algorithms can't be applied simultaneously")
 
+    def to_nncf_dict(self) -> Dict[str, Any]:
+        """
+        Returns a dictionary with the NNCF-friendly variables that are ready to use.
+        """
+        if not is_nncf_available():
+            raise ImportError("NNCF is required to execute this method. Please install nncf first.")
+
+        signed_bitness = {
+            4: "int4",
+            8: "int8",
+        }
+        mode = self.weight_format if self.weight_format else signed_bitness[self.bits]
+        if mode in signed_bitness.values():
+            mode += "_sym" if self.sym else "_asym"
+        mode = nncf.CompressWeightsMode(mode)
+
+        if isinstance(self.quant_method, str):
+            awq = self.quant_method == "awq"
+        elif isinstance(self.quant_method, OVQuantizationMethod):
+            awq = self.quant_method == OVQuantizationMethod.AWQ
+
+        sensitivity_metric = nncf.SensitivityMetric(self.sensitivity_metric) if self.sensitivity_metric else None
+        backup_mode = nncf.BackupMode(self.backup_precision) if self.backup_precision else None
+
+        return {
+            "mode": mode,
+            "ratio": self.ratio,
+            "group_size": self.group_size,
+            "all_layers": self.all_layers,
+            "sensitivity_metric": sensitivity_metric,
+            "awq": awq,
+            "scale_estimation": self.scale_estimation,
+            "gptq": self.gptq,
+            "lora_correction": self.lora_correction,
+            "backup_mode": backup_mode,
+        }
+
 
 @dataclass
 class OVDynamicQuantizationConfig(OVWeightQuantizationConfig):
@@ -694,6 +734,78 @@ class OVQuantizationConfig(OVQuantizationConfigBase):
                 f"SmoothQuant alpha parameter must be in range [0, 1], but found {self.smooth_quant_alpha}"
             )
 
+    def to_nncf_dict(self) -> Dict[str, Any]:
+        """
+        Returns a dictionary with the NNCF-friendly variables that are ready to use.
+        """
+        if not is_nncf_available():
+            raise ImportError("NNCF is required to execute this method. Please install nncf first.")
+        preset = nncf.QuantizationPreset.PERFORMANCE if self.sym else nncf.QuantizationPreset.MIXED
+
+        mode = None
+        if self.activation_format:
+            mode_map = {
+                "f8e4m3": "fp8_e4m3",
+                "f8e5m2": "fp8_e5m2",
+            }
+            mode = nncf.QuantizationMode(mode_map[self.activation_format])
+
+        model_type = nncf.ModelType(self.model_type) if self.model_type else None
+        advanced_parameters = nncf.AdvancedQuantizationParameters()
+        advanced_parameters.overflow_fix = self.overflow_fix if self.overflow_fix else None
+
+        if self.smooth_quant_alpha:
+            advanced_parameters.smooth_quant_alphas = nncf.AdvancedSmoothQuantParameters(
+                matmul=self.smooth_quant_alpha
+            )
+
+        return {
+            "mode": mode,
+            "preset": preset,
+            "target_device": nncf.TargetDevice.ANY,
+            "fast_bias_correction": self.fast_bias_correction,
+            "model_type": model_type,
+            "advanced_parameters": advanced_parameters,
+        }
+
+
+class OVMixedQuantizationConfig(OVQuantizationConfigBase):
+    def __init__(
+        self,
+        weight_quantization_config: Union[Dict, OVWeightQuantizationConfig],
+        quantization_config: Union[Dict, OVQuantizationConfig],
+        ignored_scope: Optional[dict] = None,
+        num_samples: Optional[int] = None,
+        dataset: Optional[str] = None,
+        tokenizer: Optional[str] = None,
+        processor: Optional[str] = None,
+        trust_remote_code: Optional[bool] = None,
+        **kwargs,
+    ):
+        super().__init__(
+            ignored_scope=ignored_scope,
+            num_samples=num_samples,
+            dataset=dataset,
+            tokenizer=tokenizer,
+            processor=processor,
+            trust_remote_code=trust_remote_code,
+            **kwargs,
+        )
+
+        if isinstance(weight_quantization_config, dict):
+            weight_quantization_config = OVWeightQuantizationConfig(**weight_quantization_config)
+        if isinstance(quantization_config, dict):
+            quantization_config = OVQuantizationConfig(**quantization_config)
+
+        self.weight_quantization_config = weight_quantization_config
+        self.quantization_config = quantization_config
+
+    def to_dict(self):
+        result = copy.deepcopy(self.__dict__)
+        result["weight_quantization_config"] = self.weight_quantization_config.to_dict()
+        result["quantization_config"] = self.quantization_config.to_dict()
+        return result
+
 
 class OVConfig(BaseConfig):
     CONFIG_NAME = "openvino_config.json"
@@ -717,10 +829,7 @@ class OVConfig(BaseConfig):
         self.compression = kwargs.get(
             "compression", None
         )  # A field for backward-compatability of training-time compression parameters
-        if self.quantization_config is not None:
-            self.dtype = self.quantization_config.weight_format
-        else:
-            self.dtype = dtype
+        self.dtype = dtype
 
     def add_input_info(self, model_inputs: Dict, force_batch_one: bool = False):
         self.input_info = [
@@ -734,13 +843,18 @@ class OVConfig(BaseConfig):
 
     @staticmethod
     def _quantization_config_from_dict(quantization_config: dict) -> OVQuantizationConfigBase:
-        wq_args = inspect.getfullargspec(OVWeightQuantizationConfig.__init__).args
-        q_args = inspect.getfullargspec(OVQuantizationConfig.__init__).args
+        def all_keys_match(keys, signature):
+            s_args = inspect.getfullargspec(signature.__init__).args
+            return all(arg_name in s_args for arg_name in keys)
+
         weight_only = quantization_config.pop("weight_only", None)
         config_keys = quantization_config.keys()
-        matches_wq_config_signature = all(arg_name in wq_args for arg_name in config_keys)
-        matches_q_config_signature = all(arg_name in q_args for arg_name in config_keys)
-        if matches_wq_config_signature == matches_q_config_signature:
+
+        matches_wq_config_signature = all_keys_match(config_keys, OVWeightQuantizationConfig)
+        matches_q_config_signature = all_keys_match(config_keys, OVQuantizationConfig)
+        matches_g_config_signature = all_keys_match(config_keys, OVMixedQuantizationConfig)
+
+        if matches_wq_config_signature and matches_q_config_signature:
             if weight_only is None:
                 logger.warning(
                     "Can't determine type of OV quantization config. Please specify explicitly whether you intend to "
@@ -750,7 +864,13 @@ class OVConfig(BaseConfig):
                 return OVWeightQuantizationConfig.from_dict(quantization_config)
             matches_wq_config_signature = weight_only
 
-        config_type = OVWeightQuantizationConfig if matches_wq_config_signature else OVQuantizationConfig
+        if matches_wq_config_signature:
+            config_type = OVWeightQuantizationConfig
+        elif matches_q_config_signature:
+            config_type = OVQuantizationConfig
+        elif matches_g_config_signature:
+            config_type = OVMixedQuantizationConfig
+
         return config_type.from_dict(quantization_config)
 
     def _to_dict_safe(self, to_diff_dict: bool = False) -> Dict[str, Any]:

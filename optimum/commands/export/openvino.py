@@ -342,7 +342,7 @@ class OVExportCommand(BaseOptimumCLICommand):
             if no_compression_parameter_provided(self.args) and self.args.weight_format == "int4":
                 quantization_config = get_default_int4_config(self.args.model)
             else:
-                quantization_config = prepare_for_wc_config(self.args, _DEFAULT_4BIT_CONFIG)
+                quantization_config = prepare_wq_config(self.args, _DEFAULT_4BIT_CONFIG)
 
             if quantization_config.get("dataset", None) is not None:
                 quantization_config["trust_remote_code"] = self.args.trust_remote_code
@@ -354,15 +354,21 @@ class OVExportCommand(BaseOptimumCLICommand):
                 )
 
             if self.args.quant_mode == "nf4_f8e4m3":
-                wc_config = prepare_for_wc_config(self.args, _DEFAULT_4BIT_CONFIG)
-                wc_config["weight_format"] = "nf4"
+                wq_config = prepare_wq_config(self.args, _DEFAULT_4BIT_CONFIG)
+                wq_config["weight_format"] = "nf4"
 
-                q_config = prepare_for_q_config(self.args)
+                q_config = prepare_q_config(self.args)
                 q_config["activation_format"] = "f8e4m3"
 
-                quantization_config = None
+                quantization_config = {
+                    "dataset": self.args.dataset,
+                    "num_samples": self.args.num_samples,
+                    "trust_remote_code": self.args.trust_remote_code,
+                    "weight_quantization_config": wq_config,
+                    "quantization_config": q_config,
+                }
             else:
-                quantization_config = prepare_for_q_config(self.args)
+                quantization_config = prepare_q_config(self.args)
             ov_config = OVConfig(quantization_config=quantization_config)
 
         quantization_config = ov_config.quantization_config if ov_config else None
@@ -456,7 +462,7 @@ class OVExportCommand(BaseOptimumCLICommand):
             )
 
 
-def prepare_for_wc_config(args, default_configs):
+def prepare_wq_config(args, default_configs):
     is_int8 = args.weight_format == "int8"
     return {
         "bits": 8 if is_int8 else 4,
@@ -476,7 +482,7 @@ def prepare_for_wc_config(args, default_configs):
     }
 
 
-def prepare_for_q_config(args):
+def prepare_q_config(args):
     return {
         "weight_format": args.quant_mode,
         "activation_format": args.quant_mode,
